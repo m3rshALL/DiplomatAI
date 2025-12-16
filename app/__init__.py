@@ -1,0 +1,3 @@
+"""DiplomatAI Telegram bot package."""
+
+
