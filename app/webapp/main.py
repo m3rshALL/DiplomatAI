@@ -12,9 +12,10 @@ from urllib.parse import parse_qsl
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
@@ -173,6 +174,12 @@ async def _startup() -> None:
 @app.get("/health", response_class=PlainTextResponse)
 async def health() -> str:
     return "ok"
+
+
+@app.get("/metrics")
+async def metrics() -> Response:
+    """Prometheus metrics endpoint for monitoring."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 async def _set_job(*, r: Any, job_id: str, payload: dict[str, Any], ttl_seconds: int = 15 * 60) -> None:

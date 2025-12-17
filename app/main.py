@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import sys
 import uuid
+from urllib.parse import urlparse
 
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.types import MenuButtonWebApp, WebAppInfo
 from pydantic import ValidationError
 from sqlalchemy.exc import OperationalError
 
@@ -66,14 +69,30 @@ async def main() -> None:
         token=settings.telegram_bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+
+    # Telegram Mini App требует HTTPS, а trycloudflare URL "протухает" после перезапуска tunnel.
+    # Чтобы не закреплять мёртвую ссылку в меню бота, ставим кнопку только если домен резолвится.
+    if settings.webapp_url:
+        host = urlparse(settings.webapp_url).hostname or ""
+        should_set_menu = True
+        if host.endswith("trycloudflare.com"):
+            loop = asyncio.get_running_loop()
+            try:
+                await asyncio.wait_for(loop.run_in_executor(None, socket.getaddrinfo, host, None), timeout=0.8)
+            except (asyncio.TimeoutError, OSError):
+                should_set_menu = False
+        if should_set_menu:
+            await bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(text="DiplomatAI", web_app=WebAppInfo(url=settings.webapp_url))
+            )
+
     dp = Dispatcher()
     dp.message.middleware(RequestContextMiddleware())
     dp.callback_query.middleware(RequestContextMiddleware())
 
     dp["pipeline"] = pipeline
-    await dp.start_polling(bot)
     dp.include_router(bot_router)
-
+    
     await dp.start_polling(bot)
 
 
@@ -88,17 +107,13 @@ if __name__ == "__main__":
         # Конфиг/ENV ошибки должны быть понятными и без большого traceback.
         msg = "Ошибка конфигурации."
         errors = exc.errors()
-    except (OperationalError, ConnectionRefusedError, OSError) as exc:
         if errors:
             raw_msg = errors[0].get("msg")
             if isinstance(raw_msg, str) and raw_msg:
                 msg = raw_msg.removeprefix("Value error, ").strip()
         print(msg, file=sys.stderr)
         raise SystemExit(1) from None
-    except ValueError as exc:
-        # Конфиг/ENV ошибки должны быть понятными и без большого traceback.
-        print(str(exc), file=sys.stderr)
-        raise SystemExit(1) from None
+    except (OperationalError, OSError) as exc:
         # Подключение к БД/Redis при локальном запуске часто падает, если сервисы не подняты.
         # Делаем понятное сообщение вместо огромного traceback.
         msg = (
@@ -109,6 +124,10 @@ if __name__ == "__main__":
         )
         print(msg, file=sys.stderr)
         print(f"Технические детали: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
+    except ValueError as exc:
+        # Конфиг/ENV ошибки должны быть понятными и без большого traceback.
+        print(str(exc), file=sys.stderr)
         raise SystemExit(1) from None
 
 

@@ -1,0 +1,199 @@
+# Grafana Dashboard Configuration for DiplomatAI
+# Import this JSON into Grafana to get pre-configured monitoring dashboard
+
+{
+    "dashboard": {
+        "title": "DiplomatAI Monitoring",
+        "tags": [
+            "diplomatai",
+            "telegram",
+            "bot"
+        ],
+        "timezone": "browser",
+        "refresh": "30s",
+        "time": {
+            "from": "now-6h",
+            "to": "now"
+        },
+        "panels": [
+            {
+                "id": 1,
+                "title": "Reports Generated (Total)",
+                "type": "stat",
+                "targets": [
+                    {
+                        "expr": "sum(diplomatai_reports_generated_total)",
+                        "legendFormat": "Total Reports"
+                    }
+                ],
+                "gridPos": {
+                    "h": 4,
+                    "w": 6,
+                    "x": 0,
+                    "y": 0
+                }
+            },
+            {
+                "id": 2,
+                "title": "Reports by Status",
+                "type": "piechart",
+                "targets": [
+                    {
+                        "expr": "sum by (status) (diplomatai_reports_generated_total)",
+                        "legendFormat": "{{status}}"
+                    }
+                ],
+                "gridPos": {
+                    "h": 8,
+                    "w": 6,
+                    "x": 6,
+                    "y": 0
+                }
+            },
+            {
+                "id": 3,
+                "title": "Report Generation Rate (per minute)",
+                "type": "graph",
+                "targets": [
+                    {
+                        "expr": "rate(diplomatai_reports_generated_total[5m]) * 60",
+                        "legendFormat": "{{status}}"
+                    }
+                ],
+                "gridPos": {
+                    "h": 8,
+                    "w": 12,
+                    "x": 12,
+                    "y": 0
+                }
+            },
+            {
+                "id": 4,
+                "title": "Average Report Duration",
+                "type": "stat",
+                "targets": [
+                    {
+                        "expr": "histogram_quantile(0.5, rate(diplomatai_report_duration_seconds_bucket[5m]))",
+                        "legendFormat": "p50"
+                    },
+                    {
+                        "expr": "histogram_quantile(0.95, rate(diplomatai_report_duration_seconds_bucket[5m]))",
+                        "legendFormat": "p95"
+                    }
+                ],
+                "gridPos": {
+                    "h": 4,
+                    "w": 6,
+                    "x": 0,
+                    "y": 4
+                }
+            },
+            {
+                "id": 5,
+                "title": "API Call Success Rate",
+                "type": "graph",
+                "targets": [
+                    {
+                        "expr": "sum by (service) (rate(diplomatai_api_calls_total{status=\"success\"}[5m])) / sum by (service) (rate(diplomatai_api_calls_total[5m])) * 100",
+                        "legendFormat": "{{service}}"
+                    }
+                ],
+                "gridPos": {
+                    "h": 8,
+                    "w": 12,
+                    "x": 0,
+                    "y": 8
+                }
+            },
+            {
+                "id": 6,
+                "title": "API Latency (Perplexity vs OpenAI)",
+                "type": "graph",
+                "targets": [
+                    {
+                        "expr": "histogram_quantile(0.95, rate(diplomatai_perplexity_duration_seconds_bucket[5m]))",
+                        "legendFormat": "Perplexity p95"
+                    },
+                    {
+                        "expr": "histogram_quantile(0.95, rate(diplomatai_openai_duration_seconds_bucket[5m]))",
+                        "legendFormat": "OpenAI p95"
+                    }
+                ],
+                "gridPos": {
+                    "h": 8,
+                    "w": 12,
+                    "x": 12,
+                    "y": 8
+                }
+            },
+            {
+                "id": 7,
+                "title": "Cache Hit Rate",
+                "type": "stat",
+                "targets": [
+                    {
+                        "expr": "sum(rate(diplomatai_cache_operations_total{operation=\"get\",result=\"hit\"}[5m])) / sum(rate(diplomatai_cache_operations_total{operation=\"get\"}[5m])) * 100",
+                        "legendFormat": "Hit Rate %"
+                    }
+                ],
+                "gridPos": {
+                    "h": 4,
+                    "w": 6,
+                    "x": 0,
+                    "y": 16
+                }
+            },
+            {
+                "id": 8,
+                "title": "Active Users (24h)",
+                "type": "stat",
+                "targets": [
+                    {
+                        "expr": "diplomatai_active_users_24h",
+                        "legendFormat": "Users"
+                    }
+                ],
+                "gridPos": {
+                    "h": 4,
+                    "w": 6,
+                    "x": 6,
+                    "y": 16
+                }
+            },
+            {
+                "id": 9,
+                "title": "Error Rate by Type",
+                "type": "graph",
+                "targets": [
+                    {
+                        "expr": "sum by (status) (rate(diplomatai_reports_generated_total{status=~\".*error.*|rate_limit\"}[5m])) * 60",
+                        "legendFormat": "{{status}}"
+                    }
+                ],
+                "gridPos": {
+                    "h": 8,
+                    "w": 12,
+                    "x": 12,
+                    "y": 16
+                }
+            },
+            {
+                "id": 10,
+                "title": "Telegram Messages by Type",
+                "type": "graph",
+                "targets": [
+                    {
+                        "expr": "sum by (command_type) (rate(diplomatai_telegram_messages_total[5m])) * 60",
+                        "legendFormat": "{{command_type}}"
+                    }
+                ],
+                "gridPos": {
+                    "h": 8,
+                    "w": 12,
+                    "x": 0,
+                    "y": 20
+                }
+            }
+        ]
+    }
+}

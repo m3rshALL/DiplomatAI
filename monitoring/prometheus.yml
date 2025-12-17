@@ -1,0 +1,21 @@
+# Prometheus configuration for DiplomatAI monitoring
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'diplomatai'
+    environment: 'production'
+
+scrape_configs:
+  # Scrape WebApp metrics endpoint
+  - job_name: 'diplomatai-webapp'
+    static_configs:
+      - targets: ['web:8080']
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+
+  # Scrape Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

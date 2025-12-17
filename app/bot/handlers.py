@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import socket
 import uuid
 
 import httpx
@@ -9,6 +11,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 from redis.exceptions import RedisError
+from urllib.parse import urlparse
 
 from app.core.logging import get_logger, request_id_var
 from app.services.openai_client import OpenAIRateLimitError, OpenAITemporaryError
@@ -24,6 +27,33 @@ STATUS_SEARCHING = "Ищу источники…"
 STATUS_GENERATING = "Формирую отчёт…"
 STATUS_OPENAI_429 = "OpenAI вернул 429. Попробуйте позже."
 STATUS_OPENAI_TEMP = "OpenAI временно недоступен. Попробуйте чуть позже."
+
+
+async def _is_host_resolvable(hostname: str) -> bool:
+    """
+    trycloudflare URL часто "протухает" после перезапуска tunnel, и тогда Telegram показывает ERR_NAME_NOT_RESOLVED.
+    Проверяем, что домен резолвится, чтобы не выдавать пользователю мёртвую ссылку.
+    """
+    if not hostname:
+        return False
+    loop = asyncio.get_running_loop()
+    try:
+        await asyncio.wait_for(loop.run_in_executor(None, socket.getaddrinfo, hostname, None), timeout=0.8)
+        return True
+    except (asyncio.TimeoutError, OSError):
+        return False
+
+
+async def _get_usable_webapp_url(pipeline: ReportPipeline) -> str | None:
+    url = (pipeline.settings.webapp_url or "").strip()
+    if not url:
+        return None
+    host = urlparse(url).hostname or ""
+    if not host:
+        return None
+    if host.endswith("trycloudflare.com") and not await _is_host_resolvable(host):
+        return None
+    return url
 
 
 async def _safe_edit_status(status: Message, text: str) -> None:
@@ -113,10 +143,11 @@ async def start_cmd(message: Message, pipeline: ReportPipeline) -> None:
             InlineKeyboardButton(text="Лимиты", callback_data="cmd:limits"),
         ]
     ]
-    if pipeline.settings.webapp_url:
+    webapp_url = await _get_usable_webapp_url(pipeline)
+    if webapp_url:
         buttons.insert(
             0,
-            [InlineKeyboardButton(text="Открыть Mini App", web_app=WebAppInfo(url=pipeline.settings.webapp_url))],
+            [InlineKeyboardButton(text="Открыть Mini App", web_app=WebAppInfo(url=webapp_url))],
         )
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     await message.answer(text, reply_markup=kb)
@@ -200,14 +231,26 @@ async def clarify_cmd(message: Message, pipeline: ReportPipeline) -> None:
 
 @router.message(Command("app"))
 async def app_cmd(message: Message, pipeline: ReportPipeline) -> None:
-    if not pipeline.settings.webapp_url:
+    webapp_url = await _get_usable_webapp_url(pipeline)
+    if not webapp_url:
+        if (pipeline.settings.webapp_url or "").strip():
+            await message.answer(
+                "Mini App URL сейчас не открывается (похоже, trycloudflare домен устарел).\n\n"
+                "Быстрое решение:\n"
+                "1) Перезапустите tunnel: docker-compose restart tunnel\n"
+                "2) Возьмите новый URL из логов: docker-compose logs tunnel\n"
+                "3) Обновите WEBAPP_URL в .env и перезапустите bot: docker-compose restart bot\n\n"
+                "На Windows можно автоматом обновить .env:\n"
+                "scripts\\refresh_webapp_url.bat"
+            )
+            return
         await message.answer(
             "Mini App не настроен. Укажите WEBAPP_URL (HTTPS) и перезапустите контейнеры."
         )
         return
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Открыть Mini App", web_app=WebAppInfo(url=pipeline.settings.webapp_url))]
+            [InlineKeyboardButton(text="Открыть Mini App", web_app=WebAppInfo(url=webapp_url))]
         ]
     )
     await message.answer("Откройте Mini App:", reply_markup=kb)
