@@ -3,8 +3,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import uuid
-import traceback
-from typing import Any
+
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
