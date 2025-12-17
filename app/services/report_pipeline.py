@@ -45,6 +45,9 @@ class ReportPipeline:
     openai: OpenAIClient
 
     async def get_limits(self, *, user_id: int) -> tuple[int, int]:
+        if self.settings.disable_rate_limit:
+            # Для тестирования: считаем лимит отключённым
+            return 10**9, 10**9
         used = await get_daily_used(self.redis, user_id)
         limit = self.settings.free_daily_limit
         return max(0, limit - used), limit
@@ -54,15 +57,25 @@ class ReportPipeline:
 
     async def get_report_text(self, *, user_id: int, report_id: uuid.UUID) -> str | None:
         return await self.repo.get_report_text(user_id=user_id, report_id=report_id)
+    
+    async def get_last_report_text(self, *, user_id: int) -> str | None:
+        return await self.repo.get_last_report_text(user_id=user_id)
+
+    async def followup_last_report(self, *, user_id: int, instruction: str) -> str:
+        prev = await self.get_last_report_text(user_id=user_id)
+        if not prev:
+            raise ValueError("Нет предыдущего отчёта. Сначала сформируйте отчёт запросом.")
+        return await self.openai.followup_text(previous_report_text=prev, instruction=instruction)
 
     async def run(self, *, user_id: int, query: str, stage_cb: StageCallback | None = None) -> str:
         if stage_cb is None:
             async def stage_cb(_: str) -> None:  # type: ignore[no-redef]
                 return None
 
-        used = await consume_daily_quota(self.redis, user_id)
-        if used > self.settings.free_daily_limit:
-            raise RateLimitExceeded("3 отчёта в сутки (Free)")
+        if not self.settings.disable_rate_limit:
+            used = await consume_daily_quota(self.redis, user_id)
+            if used > self.settings.free_daily_limit:
+                raise RateLimitExceeded(f"{self.settings.free_daily_limit} отчёта в сутки (Free)")
 
         await stage_cb("searching")
 

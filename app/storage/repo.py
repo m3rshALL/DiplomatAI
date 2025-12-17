@@ -73,4 +73,13 @@ class ReportRepo:
             res = await session.execute(stmt)
             return res.scalar_one_or_none()
 
-
+    async def get_last_report_text(self, *, user_id: int) -> str | None:
+        async with self._session_factory() as session:
+            stmt = (
+                select(ReportRun.report_text)
+                .where(ReportRun.user_id == user_id)
+                .order_by(ReportRun.created_at.desc())
+                .limit(1)
+            )
+            res = await session.execute(stmt)
+            return res.scalar_one_or_none()

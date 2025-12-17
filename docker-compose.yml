@@ -26,7 +26,42 @@ services:
       - postgres
       - redis
 
-volumes:
-  pgdata:
+  web:
+    build: .
+    command: uvicorn app.webapp.main:app --host 0.0.0.0 --port 8080
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/diplomat
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+      - redis
+      - bot
+
+  # Для Mini App нужен HTTPS. Этот сервис поднимает временный публичный HTTPS URL через trycloudflare.com
+  # URL можно посмотреть в логах: docker-compose logs -f tunnel
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate --url http://web:8080
+    depends_on:
+      - web
+
+  admin:
+    build: .
+    command: streamlit run app/admin/streamlit_app.py --server.address=0.0.0.0 --server.port=8501
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/diplomat
+      REDIS_URL: redis://redis:6379/0
+      PYTHONPATH: /app
+    ports:
+      - "8501:8501"
+    depends_on:
+      - postgres
+      - redis
 
 

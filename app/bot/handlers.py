@@ -1,19 +1,103 @@
 from __future__ import annotations
 
+import json
 import uuid
 
+import httpx
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
+from redis.exceptions import RedisError
 
+from app.core.logging import get_logger, request_id_var
+from app.services.openai_client import OpenAIRateLimitError, OpenAITemporaryError
 from app.services.report_pipeline import ReportPipeline, RateLimitExceeded
+from app.storage.redis import push_error_event
+from app.storage.session import append_turn, build_query_with_context, get_session, set_pref
 
 
 router = Router()
+log = get_logger(__name__)
+
+STATUS_SEARCHING = "Ищу источники…"
+STATUS_GENERATING = "Формирую отчёт…"
+STATUS_OPENAI_429 = "OpenAI вернул 429. Попробуйте позже."
+STATUS_OPENAI_TEMP = "OpenAI временно недоступен. Попробуйте чуть позже."
+
+
+async def _safe_edit_status(status: Message, text: str) -> None:
+    # Telegram возвращает ошибку, если мы пытаемся "изменить" сообщение на то же самое.
+    if (status.text or "") == text:
+        return
+    try:
+        await status.edit_text(text)
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return
+        raise
+
+
+async def _run_pipeline_with_status(*, message: Message, pipeline: ReportPipeline, query: str) -> None:
+    status = await message.answer(STATUS_SEARCHING)
+
+    async def stage_cb(stage: str) -> None:
+        if stage == "searching":
+            await _safe_edit_status(status, STATUS_SEARCHING)
+        elif stage == "generating":
+            await _safe_edit_status(status, STATUS_GENERATING)
+
+    try:
+        # Контекст/настройки пользователя (Redis)
+        uid = message.from_user.id  # type: ignore[union-attr]
+        sess = await get_session(pipeline.redis, user_id=uid)
+        q_eff = build_query_with_context(query=query, session=sess)
+        final_text = await pipeline.run(user_id=uid, query=q_eff, stage_cb=stage_cb)
+    except RateLimitExceeded as e:
+        await _safe_edit_status(status, f"Лимит исчерпан: {e}. Попробуйте завтра.")
+        return
+    except OpenAIRateLimitError as e:
+        await _safe_edit_status(status, str(e) or STATUS_OPENAI_429)
+        return
+    except OpenAITemporaryError:
+        await _safe_edit_status(status, STATUS_OPENAI_TEMP)
+        return
+    except (ValueError, httpx.TimeoutException, httpx.RequestError, httpx.HTTPStatusError, RuntimeError) as e:
+        await _safe_edit_status(status, "Не удалось сформировать отчёт из-за ошибки. Попробуйте позже.")
+        log.exception("report_failed")
+        try:
+            await push_error_event(
+                pipeline.redis,
+                service="bot",
+                message="report_failed",
+                user_id=(message.from_user.id if message.from_user else None),
+                request_id=request_id_var.get(),
+                report_id=None,
+                extra={"query": query},
+                exc=e,
+            )
+        except RedisError:
+            pass
+        return
+
+    # отправляем отдельным сообщением, чтобы статус сохранился как прогресс
+    await message.answer(final_text[:4000])
+
+    # Обновляем историю запросов (после успешного запуска)
+    try:
+        await append_turn(
+            pipeline.redis,
+            user_id=uid,
+            query=query,
+            max_turns=pipeline.settings.session_max_turns,
+            ttl_seconds=pipeline.settings.session_ttl_seconds,
+        )
+    except RedisError:
+        pass
 
 
 @router.message(Command("start"))
-async def start_cmd(message: Message) -> None:
+async def start_cmd(message: Message, pipeline: ReportPipeline) -> None:
     text = (
         "Привет! Я <b>AI-аналитик</b>.\n\n"
         "Пришлите запрос — я найду актуальные источники, соберу таблицу фактов и сформирую отчёт без выдумок.\n\n"
@@ -21,9 +105,112 @@ async def start_cmd(message: Message) -> None:
         "- Аналитика по рынку СПГ в Европе за 12 месяцев\n"
         "- Краткий отчёт по динамике инфляции в РФ в 2024 с источниками\n"
         "- Обзор санкций ЕС против РФ: последние изменения и источники\n\n"
-        "Команды: /help /history /limits"
+        "Команды: /help /history /limits /app"
     )
-    await message.answer(text)
+    buttons: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(text="История", callback_data="cmd:history"),
+            InlineKeyboardButton(text="Лимиты", callback_data="cmd:limits"),
+        ]
+    ]
+    if pipeline.settings.webapp_url:
+        buttons.insert(
+            0,
+            [InlineKeyboardButton(text="Открыть Mini App", web_app=WebAppInfo(url=pipeline.settings.webapp_url))],
+        )
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.answer(text, reply_markup=kb)
+
+@router.message(Command("focus"))
+async def focus_cmd(message: Message, pipeline: ReportPipeline) -> None:
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Использование: /focus <фокус>. Пример: /focus trade impact only")
+        return
+    focus = parts[1].strip()
+    await set_pref(
+        pipeline.redis,
+        user_id=message.from_user.id,  # type: ignore[union-attr]
+        key="focus",
+        value=focus,
+        ttl_seconds=pipeline.settings.session_ttl_seconds,
+    )
+    await message.answer(f"Фокус установлен: <b>{focus}</b>.\nСледующие запросы будут учитывать это.")
+
+
+@router.message(Command("continue"))
+async def continue_cmd(message: Message, pipeline: ReportPipeline) -> None:
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=1)
+    instruction = parts[1].strip() if len(parts) > 1 else "Продолжи анализ: углуби выводы и добавь чёткие пункты."
+
+    status = await message.answer("Продолжаю анализ…")
+    try:
+        txt = await pipeline.followup_last_report(
+            user_id=message.from_user.id,  # type: ignore[union-attr]
+            instruction=instruction,
+        )
+    except ValueError as e:
+        await _safe_edit_status(status, str(e) or "Нет предыдущего отчёта.")
+        return
+    except OpenAIRateLimitError as e:
+        await _safe_edit_status(status, str(e) or STATUS_OPENAI_429)
+        return
+    except OpenAITemporaryError:
+        await _safe_edit_status(status, STATUS_OPENAI_TEMP)
+        return
+    except (httpx.TimeoutException, httpx.RequestError, httpx.HTTPStatusError, RuntimeError):
+        await _safe_edit_status(status, "Не удалось продолжить. Попробуйте позже.")
+        return
+    await _safe_edit_status(status, "Готово.")
+    await message.answer(txt[:4000])
+
+
+@router.message(Command("clarify"))
+async def clarify_cmd(message: Message, pipeline: ReportPipeline) -> None:
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Использование: /clarify <что уточнить>. Пример: /clarify уточни методологию и источники")
+        return
+    instruction = "Уточни предыдущий отчёт по запросу пользователя: " + parts[1].strip()
+
+    status = await message.answer("Уточняю…")
+    try:
+        txt = await pipeline.followup_last_report(
+            user_id=message.from_user.id,  # type: ignore[union-attr]
+            instruction=instruction,
+        )
+    except ValueError as e:
+        await _safe_edit_status(status, str(e) or "Нет предыдущего отчёта.")
+        return
+    except OpenAIRateLimitError as e:
+        await _safe_edit_status(status, str(e) or STATUS_OPENAI_429)
+        return
+    except OpenAITemporaryError:
+        await _safe_edit_status(status, STATUS_OPENAI_TEMP)
+        return
+    except (httpx.TimeoutException, httpx.RequestError, httpx.HTTPStatusError, RuntimeError):
+        await _safe_edit_status(status, "Не удалось уточнить. Попробуйте позже.")
+        return
+    await _safe_edit_status(status, "Готово.")
+    await message.answer(txt[:4000])
+
+
+@router.message(Command("app"))
+async def app_cmd(message: Message, pipeline: ReportPipeline) -> None:
+    if not pipeline.settings.webapp_url:
+        await message.answer(
+            "Mini App не настроен. Укажите WEBAPP_URL (HTTPS) и перезапустите контейнеры."
+        )
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Открыть Mini App", web_app=WebAppInfo(url=pipeline.settings.webapp_url))]
+        ]
+    )
+    await message.answer("Откройте Mini App:", reply_markup=kb)
 
 
 @router.message(Command("help"))
@@ -70,7 +257,7 @@ async def open_report_cb(callback: CallbackQuery, pipeline: ReportPipeline) -> N
     raw = callback.data or ""
     try:
         rep_id = uuid.UUID(raw.split("rep:", 1)[1])
-    except Exception:
+    except ValueError:
         await callback.answer("Некорректный идентификатор.", show_alert=True)
         return
 
@@ -83,30 +270,39 @@ async def open_report_cb(callback: CallbackQuery, pipeline: ReportPipeline) -> N
     await callback.answer()
 
 
+@router.callback_query(F.data == "cmd:history")
+async def history_shortcut_cb(callback: CallbackQuery, pipeline: ReportPipeline) -> None:
+    if callback.message:
+        await history_cmd(callback.message, pipeline)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cmd:limits")
+async def limits_shortcut_cb(callback: CallbackQuery, pipeline: ReportPipeline) -> None:
+    if callback.message:
+        await limits_cmd(callback.message, pipeline)
+    await callback.answer()
+
+
+@router.message(F.web_app_data)
+async def webapp_data(message: Message, pipeline: ReportPipeline) -> None:
+    raw = (message.web_app_data.data or "").strip()  # type: ignore[union-attr]
+    try:
+        payload = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        await message.answer("Не удалось прочитать данные из Mini App.")
+        return
+
+    query = str(payload.get("query") or "").strip()
+    if not query:
+        await message.answer("Пустой запрос из Mini App.")
+        return
+    await _run_pipeline_with_status(message=message, pipeline=pipeline, query=query)
+
+
 @router.message(F.text)
 async def text_query(message: Message, pipeline: ReportPipeline) -> None:
     query = (message.text or "").strip()
     if not query:
         return
-
-    status = await message.answer("Ищу источники…")
-
-    async def stage_cb(stage: str) -> None:
-        if stage == "searching":
-            await status.edit_text("Ищу источники…")
-        elif stage == "generating":
-            await status.edit_text("Формирую отчёт…")
-
-    try:
-        final_text = await pipeline.run(user_id=message.from_user.id, query=query, stage_cb=stage_cb)  # type: ignore[union-attr]
-    except RateLimitExceeded as e:
-        await status.edit_text(f"Лимит исчерпан: {e}. Попробуйте завтра.")
-        return
-    except Exception:
-        await status.edit_text("Не удалось сформировать отчёт из-за ошибки. Попробуйте позже.")
-        raise
-
-    # отправляем отдельным сообщением, чтобы статус сохранился как прогресс
-    await message.answer(final_text[:4000])
-
-
+    await _run_pipeline_with_status(message=message, pipeline=pipeline, query=query)

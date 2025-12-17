@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import uuid
+import traceback
+from typing import Any
 
 from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from pydantic import ValidationError
+from sqlalchemy.exc import OperationalError
 
 from app.bot.handlers import router as bot_router
 from app.bot.middlewares import RequestContextMiddleware
@@ -57,18 +63,53 @@ async def main() -> None:
         openai=openai,
     )
 
-    bot = Bot(token=settings.telegram_bot_token, parse_mode=ParseMode.HTML)
+    bot = Bot(
+        token=settings.telegram_bot_token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
     dp = Dispatcher()
     dp.message.middleware(RequestContextMiddleware())
     dp.callback_query.middleware(RequestContextMiddleware())
 
     dp["pipeline"] = pipeline
+    await dp.start_polling(bot)
     dp.include_router(bot_router)
 
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8")
+        asyncio.run(main())
+    except ValidationError as exc:
+        # Конфиг/ENV ошибки должны быть понятными и без большого traceback.
+        msg = "Ошибка конфигурации."
+        errors = exc.errors()
+    except (OperationalError, ConnectionRefusedError, OSError) as exc:
+        if errors:
+            raw_msg = errors[0].get("msg")
+            if isinstance(raw_msg, str) and raw_msg:
+                msg = raw_msg.removeprefix("Value error, ").strip()
+        print(msg, file=sys.stderr)
+        raise SystemExit(1) from None
+    except ValueError as exc:
+        # Конфиг/ENV ошибки должны быть понятными и без большого traceback.
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1) from None
+        # Подключение к БД/Redis при локальном запуске часто падает, если сервисы не подняты.
+        # Делаем понятное сообщение вместо огромного traceback.
+        msg = (
+            "Не удалось подключиться к инфраструктуре (Postgres/Redis).\n"
+            "Проверьте, что сервисы запущены и доступны.\n"
+            "Если вы запускаете локально, выполните: docker-compose up -d postgres redis\n"
+            "Если вы запускаете в Docker, используйте: docker-compose up --build\n"
+        )
+        print(msg, file=sys.stderr)
+        print(f"Технические детали: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
 
 
